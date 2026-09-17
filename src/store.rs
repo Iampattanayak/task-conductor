@@ -1,0 +1,1696 @@
+//! `SQLite` persistence for workflow state.
+//!
+//! The `WorkflowStore` is the single authority for durable workflow records.
+//! It records the full lifecycle — instances, phase states, and transitions —
+//! so Hymenium can be queried as the source of execution truth.
+//!
+//! Default database path: `~/.local/share/hymenium/hymenium.db`
+//! Override with the `HYMENIUM_DB` environment variable.
+
+use crate::outcome::WorkflowOutcome;
+use crate::workflow::WorkflowId;
+use crate::workflow::engine::{PhaseState, PhaseStatus, WorkflowInstance, WorkflowStatus};
+use crate::workflow::template::{AgentRole, WorkflowTemplate};
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, params};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use tracing::warn;
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Error type for workflow store operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum StoreError {
+    #[error("database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("workflow not found: {0}")]
+    NotFound(String),
+
+    #[error("invalid stored value '{value}' for field '{field}': {reason}")]
+    InvalidValue {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
+
+    #[error("nested transactions are not supported")]
+    NestedTransaction,
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowStore
+// ---------------------------------------------------------------------------
+
+/// Durable `SQLite` store for workflow instances, phase states, and transitions.
+pub struct WorkflowStore {
+    /// Path to the `SQLite` database file.
+    pub db_path: PathBuf,
+    conn: Connection,
+}
+
+impl std::fmt::Debug for WorkflowStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowStore")
+            .field("db_path", &self.db_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkflowStore {
+    /// Open (or create) the workflow database at `path`, running schema migrations.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("could not create db directory: {e}")),
+                )
+            })?;
+        }
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        )?;
+        let store = Self {
+            db_path: path.to_owned(),
+            conn,
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// Return the default database path, honoring the `HYMENIUM_DB` override.
+    ///
+    /// Follows XDG conventions: `$XDG_DATA_HOME/hymenium/hymenium.db` on Linux,
+    /// or `~/.local/share/hymenium/hymenium.db` as a fallback.
+    pub fn default_path() -> PathBuf {
+        if let Ok(p) = std::env::var("HYMENIUM_DB") {
+            return PathBuf::from(p);
+        }
+        // Try XDG_DATA_HOME first, then HOME-relative fallback.
+        let base = std::env::var("XDG_DATA_HOME").map_or_else(
+            |_| {
+                std::env::var("HOME").map_or_else(
+                    |_| {
+                        eprintln!("warning: neither XDG_DATA_HOME nor HOME is set; writing hymenium.db to ./hymenium/hymenium.db");
+                        PathBuf::from(".")
+                    },
+                    |h| PathBuf::from(h).join(".local").join("share"),
+                )
+            },
+            PathBuf::from,
+        );
+        base.join("hymenium").join("hymenium.db")
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema migrations
+    // -----------------------------------------------------------------------
+
+    fn migrate(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS workflows (
+                workflow_id      TEXT PRIMARY KEY,
+                template_id      TEXT NOT NULL,
+                handoff_path     TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                current_phase    TEXT,
+                current_phase_idx INTEGER NOT NULL DEFAULT 0,
+                blocked_on       TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                template_json    TEXT NOT NULL,
+                content_hash     TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS phase_states (
+                workflow_id    TEXT NOT NULL,
+                phase_id       TEXT NOT NULL,
+                role           TEXT NOT NULL,
+                status         TEXT NOT NULL,
+                agent_id       TEXT,
+                started_at     TEXT,
+                completed_at   TEXT,
+                canopy_task_id TEXT,
+                retry_count    INTEGER NOT NULL DEFAULT 0,
+                phase_order    INTEGER NOT NULL,
+                failure_reason TEXT,
+                pending_message TEXT,
+                tool_failure_count INTEGER NOT NULL DEFAULT 0,
+                request_count      INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (workflow_id, phase_id),
+                FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_transitions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id     TEXT NOT NULL,
+                from_phase      TEXT,
+                to_phase        TEXT,
+                transitioned_at TEXT NOT NULL,
+                reason          TEXT,
+                FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_outcomes (
+                workflow_id  TEXT PRIMARY KEY,
+                outcome_json TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        // Idempotent migration: add current_phase_idx for databases created
+        // before the column existed. CREATE TABLE IF NOT EXISTS is a no-op when
+        // the table already exists, so pre-existing databases will be missing
+        // this column. SQLite does not support ADD COLUMN IF NOT EXISTS, so we
+        // check pragma_table_info first.
+        self.ensure_column(
+            "workflows",
+            "current_phase_idx",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        self.ensure_column("phase_states", "pending_message", "TEXT")?;
+
+        self.ensure_column(
+            "phase_states",
+            "tool_failure_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            "phase_states",
+            "request_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        self.ensure_column("workflows", "content_hash", "TEXT")?;
+
+        // Create a partial unique index to prevent duplicate non-terminal workflows
+        // with the same content_hash. This index applies only to non-terminal states,
+        // allowing multiple terminal workflows with the same hash.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_content_hash_active
+             ON workflows(content_hash)
+             WHERE status NOT IN ('completed', 'failed', 'cancelled', 'user_terminated');",
+        )?;
+
+        Ok(())
+    }
+
+    /// Add a column to a table if it does not already exist.
+    ///
+    /// `SQLite` lacks `ADD COLUMN IF NOT EXISTS`, so we query
+    /// `pragma_table_info` to check first.
+    ///
+    /// # Safety
+    ///
+    /// This method accepts `&'static str` parameters to enforce compile-time
+    /// string literals at the call site. All arguments MUST be string literals.
+    /// Do not call this method with externally-derived or dynamic table, column,
+    /// or declaration strings; doing so would create a SQL injection surface.
+    fn ensure_column(
+        &self,
+        table: &'static str,
+        column: &'static str,
+        declaration: &'static str,
+    ) -> Result<(), StoreError> {
+        let exists: bool = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = '{column}'"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
+            ))?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
+    /// Insert a new workflow instance (must not already exist).
+    pub fn insert_workflow(&self, inst: &WorkflowInstance) -> Result<(), StoreError> {
+        self.insert_workflow_with_hash(inst, None)
+    }
+
+    /// Insert a new workflow instance with an optional content hash for deduplication.
+    pub fn insert_workflow_with_hash(
+        &self,
+        inst: &WorkflowInstance,
+        content_hash: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let template_json = serde_json::to_string(&inst.template)?;
+        let current_phase = inst.current_phase().map(|p| p.phase_id.as_str());
+        let current_phase_idx =
+            i64::try_from(inst.current_phase_idx).map_err(|_| StoreError::InvalidValue {
+                field: "current_phase_idx",
+                value: inst.current_phase_idx.to_string(),
+                reason: format!("value {} exceeds i64::MAX", inst.current_phase_idx),
+            })?;
+
+        self.conn.execute(
+            "INSERT INTO workflows
+                (workflow_id, template_id, handoff_path, status, current_phase,
+                 current_phase_idx, blocked_on, created_at, updated_at, template_json, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                inst.workflow_id.0,
+                inst.template.template_id,
+                inst.handoff_path,
+                inst.status.to_string(),
+                current_phase,
+                current_phase_idx,
+                inst.blocked_on,
+                inst.created_at.to_rfc3339(),
+                inst.updated_at.to_rfc3339(),
+                template_json,
+                content_hash,
+            ],
+        )?;
+
+        for (order, state) in inst.phase_states.iter().enumerate() {
+            self.upsert_phase_state(&inst.workflow_id, state, order)?;
+        }
+
+        Ok(())
+    }
+
+    /// Load a workflow instance by ID, returning `None` if not found.
+    pub fn get_workflow(&self, id: &WorkflowId) -> Result<Option<WorkflowInstance>, StoreError> {
+        type Row = (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+            String,
+            String,
+            String,
+        );
+
+        let row: Result<Row, _> = self.conn.query_row(
+            "SELECT workflow_id, template_id, handoff_path, status, current_phase,
+                    current_phase_idx, blocked_on, created_at, updated_at, template_json
+             FROM workflows WHERE workflow_id = ?1",
+            params![id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,         // workflow_id
+                    row.get::<_, String>(2)?,         // handoff_path
+                    row.get::<_, String>(3)?,         // status
+                    row.get::<_, Option<String>>(4)?, // current_phase
+                    row.get::<_, i64>(5)?,            // current_phase_idx
+                    row.get::<_, Option<String>>(6)?, // blocked_on
+                    row.get::<_, String>(7)?,         // created_at
+                    row.get::<_, String>(8)?,         // updated_at
+                    row.get::<_, String>(9)?,         // template_json
+                ))
+            },
+        );
+
+        let (
+            wf_id,
+            handoff_path,
+            status_str,
+            _current_phase,
+            current_phase_idx_i64,
+            blocked_on,
+            created_at_str,
+            updated_at_str,
+            template_json,
+        ) = match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(StoreError::Sqlite(e)),
+            Ok(r) => r,
+        };
+
+        let status = parse_workflow_status(&status_str)?;
+        let template: WorkflowTemplate = serde_json::from_str(&template_json)?;
+        let created_at = parse_datetime(&created_at_str, "created_at")?;
+        let updated_at = parse_datetime(&updated_at_str, "updated_at")?;
+
+        let current_phase_idx =
+            usize::try_from(current_phase_idx_i64).map_err(|_| StoreError::InvalidValue {
+                field: "current_phase_idx",
+                value: current_phase_idx_i64.to_string(),
+                reason: format!("value {current_phase_idx_i64} is negative or exceeds usize::MAX"),
+            })?;
+
+        let phase_states = self.load_phase_states(&WorkflowId(wf_id.clone()))?;
+
+        Ok(Some(WorkflowInstance {
+            workflow_id: WorkflowId(wf_id),
+            template,
+            handoff_path,
+            status,
+            blocked_on,
+            current_phase_idx,
+            phase_states,
+            transitions: Vec::new(),
+            created_at,
+            updated_at,
+        }))
+    }
+
+    /// Find a workflow by content hash that is not in a terminal state.
+    ///
+    /// Returns the most recent non-terminal workflow with the given content hash,
+    /// or `None` if no such workflow exists. Terminal states are: `completed`,
+    /// `failed`, `cancelled`, and `user_terminated`.
+    ///
+    /// If the returned workflow is in `blocked_on_gate`, `awaiting_repair`, or
+    /// `awaiting_user_input` status, a warning is emitted to alert the caller that
+    /// operator intervention may be needed.
+    pub fn find_workflow_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<WorkflowInstance>, StoreError> {
+        let row: Result<String, _> = self.conn.query_row(
+            "SELECT workflow_id FROM workflows
+             WHERE content_hash = ?1
+               AND status NOT IN ('completed', 'failed', 'cancelled', 'user_terminated')
+             ORDER BY created_at DESC
+             LIMIT 1",
+            params![hash],
+            |r| r.get(0),
+        );
+
+        match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StoreError::Sqlite(e)),
+            Ok(wf_id) => {
+                let result = self.get_workflow(&WorkflowId(wf_id))?;
+                if let Some(ref wf) = result {
+                    if matches!(
+                        wf.status,
+                        WorkflowStatus::BlockedOnGate
+                            | WorkflowStatus::AwaitingRepair
+                            | WorkflowStatus::AwaitingUserInput
+                    ) {
+                        warn!(
+                            workflow_id = %wf.workflow_id,
+                            status = %wf.status,
+                            "find_workflow_by_hash: returning a non-progressing workflow; operator may need to reconcile or force-advance"
+                        );
+                    }
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// Atomically find or insert a workflow by content hash.
+    ///
+    /// If a non-terminal workflow with the given hash already exists, returns it.
+    /// Otherwise, inserts the new workflow instance and returns it.
+    ///
+    /// Uses INSERT OR IGNORE with a partial UNIQUE index to prevent duplicate
+    /// non-terminal workflows for the same content_hash in concurrent scenarios.
+    /// When multiple writers race to insert the same hash:
+    /// - The first INSERT succeeds and creates the row and phase states.
+    /// - Subsequent INSERTs are silently rejected by the UNIQUE constraint.
+    /// - All writers then SELECT and return the canonical (existing) row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` if the transaction fails or if a database constraint is violated.
+    pub fn find_and_insert_workflow_by_hash(
+        &self,
+        inst: &WorkflowInstance,
+        content_hash: &str,
+    ) -> Result<WorkflowInstance, StoreError> {
+        self.with_transaction::<_, WorkflowInstance, StoreError>(|store| {
+            // Attempt to insert the workflow row using INSERT OR IGNORE.
+            // If the content_hash already has a non-terminal workflow, this is silently rejected.
+            // If the insert succeeds, we also insert the phase states.
+            let template_json = serde_json::to_string(&inst.template)?;
+            let current_phase = inst.current_phase().map(|p| p.phase_id.as_str());
+            let current_phase_idx =
+                i64::try_from(inst.current_phase_idx).map_err(|_| StoreError::InvalidValue {
+                    field: "current_phase_idx",
+                    value: inst.current_phase_idx.to_string(),
+                    reason: format!("value {} exceeds i64::MAX", inst.current_phase_idx),
+                })?;
+
+            let inserted = store.conn.execute(
+                "INSERT OR IGNORE INTO workflows
+                    (workflow_id, template_id, handoff_path, status, current_phase,
+                     current_phase_idx, blocked_on, created_at, updated_at, template_json, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    inst.workflow_id.0,
+                    inst.template.template_id,
+                    inst.handoff_path,
+                    inst.status.to_string(),
+                    current_phase,
+                    current_phase_idx,
+                    inst.blocked_on,
+                    inst.created_at.to_rfc3339(),
+                    inst.updated_at.to_rfc3339(),
+                    template_json,
+                    Some(content_hash),
+                ],
+            )?;
+
+            // Only insert phase states if this transaction's INSERT succeeded.
+            if inserted > 0 {
+                for (order, state) in inst.phase_states.iter().enumerate() {
+                    store.upsert_phase_state(&inst.workflow_id, state, order)?;
+                }
+            }
+
+            // Now query for the canonical non-terminal workflow with this hash.
+            // If this transaction's INSERT succeeded, we'll find the row we just inserted.
+            // If our INSERT was rejected due to a concurrent insert, we'll find the existing row.
+            let row: Result<String, _> = store.conn.query_row(
+                "SELECT workflow_id FROM workflows
+                 WHERE content_hash = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'user_terminated')
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                params![content_hash],
+                |r| r.get(0),
+            );
+
+            match row {
+                Ok(wf_id) => {
+                    // Return the canonical workflow (either ours or a concurrent writer's).
+                    store.get_workflow(&WorkflowId(wf_id.clone()))?
+                        .ok_or_else(|| StoreError::NotFound(wf_id))
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // This should not happen if the INSERT OR IGNORE worked correctly,
+                    // but we handle it defensively.
+                    Err(StoreError::NotFound(
+                        "no workflow found after insert attempt".to_string(),
+                    ))
+                }
+                Err(e) => Err(StoreError::Sqlite(e)),
+            }
+        })
+    }
+
+    /// Update the top-level status and `blocked_on` for a workflow.
+    pub fn update_workflow_status(
+        &self,
+        id: &WorkflowId,
+        status: &WorkflowStatus,
+        blocked_on: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE workflows SET status = ?1, blocked_on = ?2, updated_at = ?3
+             WHERE workflow_id = ?4",
+            params![
+                status.to_string(),
+                blocked_on,
+                Utc::now().to_rfc3339(),
+                id.0,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(id.0.clone()));
+        }
+        Ok(())
+    }
+
+    /// Update the current phase index for a workflow.
+    pub fn update_current_phase_idx(
+        &self,
+        id: &WorkflowId,
+        current_phase_idx: usize,
+    ) -> Result<(), StoreError> {
+        let current_phase_idx_i64 =
+            i64::try_from(current_phase_idx).map_err(|_| StoreError::InvalidValue {
+                field: "current_phase_idx",
+                value: current_phase_idx.to_string(),
+                reason: format!("value {current_phase_idx} exceeds i64::MAX"),
+            })?;
+        let updated = self.conn.execute(
+            "UPDATE workflows SET current_phase_idx = ?1, updated_at = ?2
+             WHERE workflow_id = ?3",
+            params![current_phase_idx_i64, Utc::now().to_rfc3339(), id.0,],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(id.0.clone()));
+        }
+        Ok(())
+    }
+
+    /// List all workflows that are not in a terminal state.
+    ///
+    /// Uses two queries instead of N+1: one to fetch all active workflow rows,
+    /// and one to fetch all their phase_states in a single IN clause.
+    pub fn list_active_workflows(&self) -> Result<Vec<WorkflowInstance>, StoreError> {
+        // Query 1: fetch all active workflow rows in one round-trip.
+        let mut stmt = self.conn.prepare(
+            "SELECT workflow_id, template_id, handoff_path, status, current_phase,
+                    current_phase_idx, blocked_on, created_at, updated_at, template_json
+             FROM workflows
+             WHERE status NOT IN ('completed', 'failed', 'cancelled', 'user_terminated')
+             ORDER BY created_at DESC",
+        )?;
+
+        type WorkflowRow = (
+            String,         // workflow_id (0)
+            String,         // handoff_path (2)
+            String,         // status (3)
+            Option<String>, // current_phase (4)
+            i64,            // current_phase_idx (5)
+            Option<String>, // blocked_on (6)
+            String,         // created_at (7)
+            String,         // updated_at (8)
+            String,         // template_json (9)
+        );
+
+        let workflow_rows: Vec<WorkflowRow> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,         // workflow_id
+                    row.get::<_, String>(2)?,         // handoff_path
+                    row.get::<_, String>(3)?,         // status
+                    row.get::<_, Option<String>>(4)?, // current_phase
+                    row.get::<_, i64>(5)?,            // current_phase_idx
+                    row.get::<_, Option<String>>(6)?, // blocked_on
+                    row.get::<_, String>(7)?,         // created_at
+                    row.get::<_, String>(8)?,         // updated_at
+                    row.get::<_, String>(9)?,         // template_json
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        if workflow_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Query 2: fetch all phase_states for the active workflows in one round-trip.
+        // SQLite supports up to 999 bound parameters; chunk if needed.
+        let ids: Vec<&str> = workflow_rows.iter().map(|(id, ..)| id.as_str()).collect();
+
+        // Build a map from workflow_id to phase_states.
+        let mut phase_map: std::collections::HashMap<String, Vec<PhaseState>> =
+            std::collections::HashMap::with_capacity(ids.len());
+
+        for chunk in ids.chunks(999) {
+            let placeholders = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT workflow_id, phase_id, role, status, agent_id, started_at,
+                        completed_at, canopy_task_id, retry_count, failure_reason,
+                        pending_message, tool_failure_count, request_count
+                 FROM phase_states
+                 WHERE workflow_id IN ({placeholders})
+                 ORDER BY workflow_id, phase_order ASC"
+            );
+            let mut ps_stmt = self.conn.prepare(&sql)?;
+            let ps_rows = ps_stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,          // workflow_id
+                        row.get::<_, String>(1)?,          // phase_id
+                        row.get::<_, String>(2)?,          // role
+                        row.get::<_, String>(3)?,          // status
+                        row.get::<_, Option<String>>(4)?,  // agent_id
+                        row.get::<_, Option<String>>(5)?,  // started_at
+                        row.get::<_, Option<String>>(6)?,  // completed_at
+                        row.get::<_, Option<String>>(7)?,  // canopy_task_id
+                        row.get::<_, u32>(8)?,             // retry_count
+                        row.get::<_, Option<String>>(9)?,  // failure_reason
+                        row.get::<_, Option<String>>(10)?, // pending_message
+                        row.get::<_, u32>(11)?,            // tool_failure_count
+                        row.get::<_, u32>(12)?,            // request_count
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for (
+                wf_id,
+                phase_id,
+                role_str,
+                status_str,
+                agent_id,
+                started_str,
+                completed_str,
+                canopy_id,
+                retry_count,
+                failure_reason,
+                pending_message,
+                tool_failure_count,
+                request_count,
+            ) in ps_rows
+            {
+                let role = parse_agent_role(&role_str)?;
+                let phase_status = parse_phase_status(&status_str)?;
+                let started_at = started_str
+                    .map(|s| parse_datetime(&s, "started_at"))
+                    .transpose()?;
+                let completed_at = completed_str
+                    .map(|s| parse_datetime(&s, "completed_at"))
+                    .transpose()?;
+                phase_map.entry(wf_id).or_default().push(PhaseState {
+                    phase_id,
+                    role,
+                    status: phase_status,
+                    agent_id,
+                    canopy_task_id: canopy_id,
+                    started_at,
+                    completed_at,
+                    failure_reason,
+                    pending_message,
+                    retry_count,
+                    tool_failure_count,
+                    request_count,
+                });
+            }
+        }
+
+        // Assemble WorkflowInstance values from the two result sets.
+        let mut results = Vec::with_capacity(workflow_rows.len());
+        for (
+            wf_id,
+            handoff_path,
+            status_str,
+            _current_phase,
+            current_phase_idx_i64,
+            blocked_on,
+            created_at_str,
+            updated_at_str,
+            template_json,
+        ) in workflow_rows
+        {
+            let status = parse_workflow_status(&status_str)?;
+            let template: WorkflowTemplate = serde_json::from_str(&template_json)?;
+            let created_at = parse_datetime(&created_at_str, "created_at")?;
+            let updated_at = parse_datetime(&updated_at_str, "updated_at")?;
+            let current_phase_idx =
+                usize::try_from(current_phase_idx_i64).map_err(|_| StoreError::InvalidValue {
+                    field: "current_phase_idx",
+                    value: current_phase_idx_i64.to_string(),
+                    reason: format!(
+                        "value {current_phase_idx_i64} is negative or exceeds usize::MAX"
+                    ),
+                })?;
+            let phase_states = phase_map.remove(&wf_id).unwrap_or_default();
+            results.push(WorkflowInstance {
+                workflow_id: WorkflowId(wf_id),
+                template,
+                handoff_path,
+                status,
+                blocked_on,
+                current_phase_idx,
+                phase_states,
+                transitions: Vec::new(),
+                created_at,
+                updated_at,
+            });
+        }
+        Ok(results)
+    }
+
+    /// Record a phase transition event in the audit log.
+    pub fn record_transition(
+        &self,
+        id: &WorkflowId,
+        from: Option<&str>,
+        to: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO workflow_transitions (workflow_id, from_phase, to_phase, transitioned_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.0,
+                from,
+                to,
+                Utc::now().to_rfc3339(),
+                reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Upsert a single phase state record.
+    pub fn upsert_phase_state(
+        &self,
+        workflow_id: &WorkflowId,
+        state: &PhaseState,
+        order: usize,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO phase_states
+                (workflow_id, phase_id, role, status, agent_id, started_at,
+                 completed_at, canopy_task_id, retry_count, phase_order, failure_reason, pending_message,
+                 tool_failure_count, request_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(workflow_id, phase_id) DO UPDATE SET
+                role = excluded.role,
+                status = excluded.status,
+                agent_id = excluded.agent_id,
+                started_at = excluded.started_at,
+                completed_at = excluded.completed_at,
+                canopy_task_id = excluded.canopy_task_id,
+                retry_count = excluded.retry_count,
+                phase_order = excluded.phase_order,
+                failure_reason = excluded.failure_reason,
+                pending_message = excluded.pending_message,
+                tool_failure_count = excluded.tool_failure_count,
+                request_count = excluded.request_count",
+            params![
+                workflow_id.0,
+                state.phase_id,
+                state.role.to_string(),
+                state.status.to_string(),
+                state.agent_id,
+                state.started_at.map(|t| t.to_rfc3339()),
+                state.completed_at.map(|t| t.to_rfc3339()),
+                state.canopy_task_id,
+                state.retry_count,
+                i64::try_from(order).map_err(|_| StoreError::InvalidValue {
+                    field: "phase_order",
+                    value: order.to_string(),
+                    reason: format!("value {order} exceeds i64::MAX"),
+                })?,
+                state.failure_reason,
+                state.pending_message.as_deref(),
+                i64::from(state.tool_failure_count),
+                i64::from(state.request_count),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a terminal workflow outcome.
+    ///
+    /// Uses `INSERT OR REPLACE` so calling this a second time (e.g. on retry
+    /// of the emit step) is safe — the latest outcome wins.
+    pub fn insert_outcome(&self, outcome: &WorkflowOutcome) -> Result<(), StoreError> {
+        let json = serde_json::to_string(outcome)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO workflow_outcomes (workflow_id, outcome_json, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![outcome.workflow_id.0, json, Utc::now().to_rfc3339(),],
+        )?;
+        Ok(())
+    }
+
+    /// Load the stored outcome for a workflow, returning `None` if not found.
+    pub fn get_outcome(&self, id: &WorkflowId) -> Result<Option<WorkflowOutcome>, StoreError> {
+        let row: Result<String, _> = self.conn.query_row(
+            "SELECT outcome_json FROM workflow_outcomes WHERE workflow_id = ?1",
+            params![id.0],
+            |r| r.get(0),
+        );
+        match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StoreError::Sqlite(e)),
+            Ok(json) => {
+                let outcome = serde_json::from_str(&json)?;
+                Ok(Some(outcome))
+            }
+        }
+    }
+
+    /// Return `true` if a terminal outcome has already been recorded for this workflow.
+    pub fn outcome_exists(&self, id: &WorkflowId) -> Result<bool, StoreError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM workflow_outcomes WHERE workflow_id = ?1",
+            params![id.0],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Execute a sequence of operations within a single `SQLite` transaction.
+    ///
+    /// This ensures that either all operations succeed or all are rolled back,
+    /// preventing partial state corruption when multiple persistence steps are needed.
+    ///
+    /// The closure can return any error type `E` as long as `StoreError` is convertible
+    /// to `E` (typically via `#[from]`). This allows the caller's typed error enum to
+    /// be returned directly from the closure without intermediate conversions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hymenium::store::{WorkflowStore, StoreError};
+    /// # use std::path::PathBuf;
+    /// # use std::time::{SystemTime, UNIX_EPOCH};
+    ///
+    /// let nanos = SystemTime::now()
+    ///     .duration_since(UNIX_EPOCH)
+    ///     .unwrap()
+    ///     .subsec_nanos();
+    /// let path = std::env::temp_dir().join(format!("hymenium_doctest_{}.db", nanos));
+    /// let store = WorkflowStore::open(&path).expect("open store");
+    /// let result = store.with_transaction::<_, _, StoreError>(|_s| Ok(42));
+    /// assert!(result.is_ok());
+    /// ```
+    pub fn with_transaction<F, T, E>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&Self) -> Result<T, E>,
+        E: From<StoreError>,
+    {
+        if !self.conn.is_autocommit() {
+            return Err(E::from(StoreError::NestedTransaction));
+        }
+
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(StoreError::from)
+            .map_err(E::from)?;
+        match f(self) {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(StoreError::from)
+                    .map_err(E::from)?;
+                Ok(value)
+            }
+            Err(e) => {
+                if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
+                    eprintln!("warning: rollback failed after error: {rollback_err}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    fn load_phase_states(&self, workflow_id: &WorkflowId) -> Result<Vec<PhaseState>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT phase_id, role, status, agent_id, started_at, completed_at,
+                    canopy_task_id, retry_count, failure_reason, pending_message,
+                    tool_failure_count, request_count
+             FROM phase_states
+             WHERE workflow_id = ?1
+             ORDER BY phase_order ASC",
+        )?;
+
+        let rows = stmt
+            .query_map(params![workflow_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,         // phase_id
+                    row.get::<_, String>(1)?,         // role
+                    row.get::<_, String>(2)?,         // status
+                    row.get::<_, Option<String>>(3)?, // agent_id
+                    row.get::<_, Option<String>>(4)?, // started_at
+                    row.get::<_, Option<String>>(5)?, // completed_at
+                    row.get::<_, Option<String>>(6)?, // canopy_task_id
+                    row.get::<_, u32>(7)?,            // retry_count
+                    row.get::<_, Option<String>>(8)?, // failure_reason
+                    row.get::<_, Option<String>>(9)?, // pending_message
+                    row.get::<_, u32>(10)?,           // tool_failure_count
+                    row.get::<_, u32>(11)?,           // request_count
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for (
+            phase_id,
+            role_str,
+            status_str,
+            agent_id,
+            started_str,
+            completed_str,
+            canopy_id,
+            retry_count,
+            failure_reason,
+            pending_message,
+            tool_failure_count,
+            request_count,
+        ) in rows
+        {
+            let role = parse_agent_role(&role_str)?;
+            let phase_status = parse_phase_status(&status_str)?;
+            let started_at = started_str
+                .map(|s| parse_datetime(&s, "started_at"))
+                .transpose()?;
+            let completed_at = completed_str
+                .map(|s| parse_datetime(&s, "completed_at"))
+                .transpose()?;
+
+            result.push(PhaseState {
+                phase_id,
+                role,
+                status: phase_status,
+                agent_id,
+                canopy_task_id: canopy_id,
+                started_at,
+                completed_at,
+                failure_reason,
+                pending_message,
+                retry_count,
+                tool_failure_count,
+                request_count,
+            });
+        }
+
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parse helpers
+// ---------------------------------------------------------------------------
+
+fn parse_workflow_status(s: &str) -> Result<WorkflowStatus, StoreError> {
+    match s {
+        "pending" => Ok(WorkflowStatus::Pending),
+        "dispatched" => Ok(WorkflowStatus::Dispatched),
+        "in_progress" => Ok(WorkflowStatus::InProgress),
+        "blocked_on_gate" => Ok(WorkflowStatus::BlockedOnGate),
+        "awaiting_repair" => Ok(WorkflowStatus::AwaitingRepair),
+        "awaiting_user_input" => Ok(WorkflowStatus::AwaitingUserInput),
+        "user_terminated" => Ok(WorkflowStatus::UserTerminated),
+        "completed" => Ok(WorkflowStatus::Completed),
+        "failed" => Ok(WorkflowStatus::Failed),
+        "cancelled" => Ok(WorkflowStatus::Cancelled),
+        other => Err(StoreError::InvalidValue {
+            field: "status",
+            value: other.to_string(),
+            reason: "unknown workflow status".to_string(),
+        }),
+    }
+}
+
+fn parse_phase_status(s: &str) -> Result<PhaseStatus, StoreError> {
+    match s {
+        "pending" => Ok(PhaseStatus::Pending),
+        "active" => Ok(PhaseStatus::Active),
+        "awaiting_user_input" => Ok(PhaseStatus::AwaitingUserInput),
+        "completed" => Ok(PhaseStatus::Completed),
+        "failed" => Ok(PhaseStatus::Failed),
+        "skipped" => Ok(PhaseStatus::Skipped),
+        other => Err(StoreError::InvalidValue {
+            field: "phase status",
+            value: other.to_string(),
+            reason: "unknown phase status".to_string(),
+        }),
+    }
+}
+
+fn parse_agent_role(s: &str) -> Result<AgentRole, StoreError> {
+    // Direct match against the canonical serde rename strings to avoid the
+    // String allocation + serde_json round-trip that the previous implementation used.
+    match s {
+        "Spec Author" => Ok(AgentRole::SpecAuthor),
+        "Workflow Planner" => Ok(AgentRole::WorkflowPlanner),
+        "Packet Compiler" => Ok(AgentRole::PacketCompiler),
+        "Decomposition Checker" => Ok(AgentRole::DecompositionChecker),
+        "Workflow Coordinator" => Ok(AgentRole::WorkflowCoordinator),
+        "Worker" => Ok(AgentRole::Worker),
+        "Output Verifier" => Ok(AgentRole::OutputVerifier),
+        "Repair Worker" => Ok(AgentRole::RepairWorker),
+        "Final Verifier" => Ok(AgentRole::FinalVerifier),
+        other => Err(StoreError::InvalidValue {
+            field: "role",
+            value: other.to_string(),
+            reason: "unknown agent role".to_string(),
+        }),
+    }
+}
+
+fn parse_datetime(s: &str, field: &'static str) -> Result<DateTime<Utc>, StoreError> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| StoreError::InvalidValue {
+            field,
+            value: s.to_string(),
+            reason: e.to_string(),
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::template::impl_audit_default;
+
+    fn temp_store() -> WorkflowStore {
+        // Use an in-memory SQLite database for unit tests.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let store = WorkflowStore {
+            db_path: PathBuf::from(":memory:"),
+            conn,
+        };
+        store.migrate().expect("migrate");
+        store
+    }
+
+    fn make_instance(id: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            WorkflowId(id.to_string()),
+            impl_audit_default(),
+            "/path/to/handoff.md",
+        )
+    }
+
+    #[test]
+    fn test_round_trip_insert_get() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWF0000000000000000001");
+
+        store.insert_workflow(&inst).expect("insert");
+
+        let loaded = store
+            .get_workflow(&inst.workflow_id)
+            .expect("get")
+            .expect("should exist");
+
+        assert_eq!(loaded.workflow_id, inst.workflow_id);
+        assert_eq!(loaded.status, WorkflowStatus::Pending);
+        assert_eq!(loaded.handoff_path, "/path/to/handoff.md");
+        assert_eq!(loaded.phase_states.len(), 2);
+        assert_eq!(loaded.phase_states[0].phase_id, "implement");
+        assert_eq!(loaded.phase_states[1].phase_id, "audit");
+    }
+
+    #[test]
+    fn test_get_nonexistent_returns_none() {
+        let store = temp_store();
+        let result = store
+            .get_workflow(&WorkflowId("not-a-real-id".to_string()))
+            .expect("query should not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_update_workflow_status() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWF0000000000000000002");
+        store.insert_workflow(&inst).expect("insert");
+
+        store
+            .update_workflow_status(
+                &inst.workflow_id,
+                &WorkflowStatus::BlockedOnGate,
+                Some("exit gate: code_diff_exists not satisfied"),
+            )
+            .expect("update");
+
+        let loaded = store
+            .get_workflow(&inst.workflow_id)
+            .expect("get")
+            .expect("should exist");
+
+        assert_eq!(loaded.status, WorkflowStatus::BlockedOnGate);
+        assert_eq!(
+            loaded.blocked_on.as_deref(),
+            Some("exit gate: code_diff_exists not satisfied")
+        );
+    }
+
+    #[test]
+    fn test_list_active_excludes_terminal() {
+        let store = temp_store();
+
+        let active = make_instance("01JNQWF0000000000000000003");
+        store.insert_workflow(&active).expect("insert active");
+
+        let mut done = make_instance("01JNQWF0000000000000000004");
+        done.status = WorkflowStatus::Completed;
+        store.insert_workflow(&done).expect("insert completed");
+
+        let active_list = store.list_active_workflows().expect("list");
+        assert_eq!(active_list.len(), 1);
+        assert_eq!(active_list[0].workflow_id.0, "01JNQWF0000000000000000003");
+    }
+
+    #[test]
+    fn test_record_transition() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWF0000000000000000005");
+        store.insert_workflow(&inst).expect("insert");
+
+        store
+            .record_transition(
+                &inst.workflow_id,
+                Some("implement"),
+                Some("audit"),
+                Some("gates satisfied"),
+            )
+            .expect("record");
+
+        // Verify row exists.
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = ?1",
+                params![inst.workflow_id.0],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    // -- outcome persistence -------------------------------------------------
+
+    #[test]
+    fn test_insert_outcome_round_trip() {
+        use crate::outcome::WorkflowOutcome;
+        use crate::workflow::engine::WorkflowStatus;
+
+        let store = temp_store();
+        let mut inst = make_instance("01JNQWF0000000000000000006");
+        inst.status = WorkflowStatus::Completed;
+        store.insert_workflow(&inst).expect("insert workflow");
+
+        let outcome = WorkflowOutcome::build(&inst, None, Utc::now());
+        store.insert_outcome(&outcome).expect("insert outcome");
+
+        // Verify the row is present.
+        assert!(
+            store.outcome_exists(&inst.workflow_id).expect("check"),
+            "outcome should exist after insert"
+        );
+
+        // Verify we can read the JSON back and it has the required keys.
+        let json_str: String = store
+            .conn
+            .query_row(
+                "SELECT outcome_json FROM workflow_outcomes WHERE workflow_id = ?1",
+                params![inst.workflow_id.0],
+                |r| r.get(0),
+            )
+            .expect("read outcome_json");
+
+        let value: serde_json::Value = serde_json::from_str(&json_str).expect("parse outcome json");
+        assert_eq!(value["schema_version"], "1.0");
+        assert_eq!(value["terminal_status"], "completed");
+        assert!(value["attempt_count"].as_i64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn test_outcome_not_exists_before_insert() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWF0000000000000000007");
+        store.insert_workflow(&inst).expect("insert workflow");
+
+        assert!(
+            !store.outcome_exists(&inst.workflow_id).expect("check"),
+            "outcome should not exist before insert"
+        );
+    }
+
+    #[test]
+    fn test_insert_outcome_replace_is_safe() {
+        use crate::outcome::WorkflowOutcome;
+        use crate::workflow::engine::WorkflowStatus;
+
+        let store = temp_store();
+        let mut inst = make_instance("01JNQWF0000000000000000008");
+        inst.status = WorkflowStatus::Completed;
+        store.insert_workflow(&inst).expect("insert workflow");
+
+        let outcome = WorkflowOutcome::build(&inst, None, Utc::now());
+        store.insert_outcome(&outcome).expect("first insert");
+        // Inserting again (INSERT OR REPLACE) should not error.
+        store
+            .insert_outcome(&outcome)
+            .expect("second insert (replace)");
+
+        // Still exactly one row.
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_outcomes WHERE workflow_id = ?1",
+                params![inst.workflow_id.0],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    // -- regression tests for terminal-transition-hardening ------------------
+
+    #[test]
+    fn test_current_phase_idx_persisted_and_loaded() {
+        use crate::workflow::engine::PhaseStatus;
+
+        let store = temp_store();
+        let mut inst = make_instance("01JNQWF0000000000000000009");
+
+        // Start at phase 0 (implement)
+        assert_eq!(inst.current_phase_idx, 0);
+
+        store.insert_workflow(&inst).expect("insert");
+
+        // Simulate phase 0 completion
+        inst.phase_states[0].status = PhaseStatus::Completed;
+        inst.phase_states[0].completed_at = Some(Utc::now());
+        store
+            .upsert_phase_state(&inst.workflow_id, &inst.phase_states[0], 0)
+            .expect("upsert phase 0");
+
+        // Manually advance to phase 1 (audit)
+        inst.current_phase_idx = 1;
+        inst.phase_states[1].status = PhaseStatus::Active;
+        inst.phase_states[1].started_at = Some(Utc::now());
+        store
+            .upsert_phase_state(&inst.workflow_id, &inst.phase_states[1], 1)
+            .expect("upsert phase 1");
+
+        // Now persist the new current_phase_idx
+        store
+            .update_current_phase_idx(&inst.workflow_id, 1)
+            .expect("update phase idx");
+
+        // Reload and verify current_phase_idx is 1 (from direct read, not heuristic)
+        let loaded = store
+            .get_workflow(&inst.workflow_id)
+            .expect("get")
+            .expect("should exist");
+
+        assert_eq!(
+            loaded.current_phase_idx, 1,
+            "current_phase_idx should be loaded as 1"
+        );
+        assert_eq!(
+            loaded.phase_states[1].status,
+            PhaseStatus::Active,
+            "phase 1 should be active"
+        );
+    }
+
+    #[test]
+    fn test_current_phase_idx_persisted_column_overrides_heuristic() {
+        use crate::workflow::engine::PhaseStatus;
+
+        let store = temp_store();
+        let mut inst = make_instance("01JNQWF0000000000000000010");
+
+        // Insert with current_phase_idx = 0
+        store.insert_workflow(&inst).expect("insert");
+
+        // Manually mark both phases as "completed" (an impossible state that the old
+        // heuristic would mishandle). The heuristic would compute (1 + 1) = 2, then
+        // clamp to len().saturating_sub(1) = 1, which happens to be correct here.
+        // But the persisted current_phase_idx should be the source of truth.
+        inst.phase_states[0].status = PhaseStatus::Completed;
+        inst.phase_states[0].completed_at = Some(Utc::now());
+        store
+            .upsert_phase_state(&inst.workflow_id, &inst.phase_states[0], 0)
+            .expect("upsert phase 0");
+
+        inst.phase_states[1].status = PhaseStatus::Completed;
+        inst.phase_states[1].completed_at = Some(Utc::now());
+        store
+            .upsert_phase_state(&inst.workflow_id, &inst.phase_states[1], 1)
+            .expect("upsert phase 1");
+
+        // Explicitly set current_phase_idx to 1 (the correct value in this scenario).
+        store
+            .update_current_phase_idx(&inst.workflow_id, 1)
+            .expect("update phase idx");
+
+        // Reload and verify we get current_phase_idx = 1 from the persisted column.
+        let loaded = store
+            .get_workflow(&inst.workflow_id)
+            .expect("get")
+            .expect("should exist");
+
+        assert_eq!(
+            loaded.current_phase_idx, 1,
+            "persisted current_phase_idx should override heuristic scanning"
+        );
+    }
+
+    /// Regression: `migrate()` must add the `current_phase_idx` column to
+    /// databases created before it existed. Simulates the old schema by
+    /// creating the workflows table without the column, then running
+    /// `migrate()` and verifying the column exists with a default of 0.
+    #[test]
+    fn test_migrate_adds_current_phase_idx_to_old_schema() {
+        // Create an in-memory database with the OLD schema (no current_phase_idx).
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE workflows (
+                workflow_id      TEXT PRIMARY KEY,
+                template_id      TEXT NOT NULL,
+                handoff_path     TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                current_phase    TEXT,
+                blocked_on       TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                template_json    TEXT NOT NULL
+            );
+
+            CREATE TABLE phase_states (
+                workflow_id    TEXT NOT NULL,
+                phase_id       TEXT NOT NULL,
+                role           TEXT NOT NULL,
+                status         TEXT NOT NULL,
+                agent_id       TEXT,
+                started_at     TEXT,
+                completed_at   TEXT,
+                canopy_task_id TEXT,
+                retry_count    INTEGER NOT NULL DEFAULT 0,
+                phase_order    INTEGER NOT NULL,
+                failure_reason TEXT,
+                PRIMARY KEY (workflow_id, phase_id),
+                FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE workflow_transitions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id     TEXT NOT NULL,
+                from_phase      TEXT,
+                to_phase        TEXT,
+                transitioned_at TEXT NOT NULL,
+                reason          TEXT,
+                FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE workflow_outcomes (
+                workflow_id  TEXT PRIMARY KEY,
+                outcome_json TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            );
+            ",
+        )
+        .expect("create old schema");
+
+        // Insert a row using the old schema (no current_phase_idx column).
+        let now = chrono::Utc::now().to_rfc3339();
+        let template_json = serde_json::to_string(&crate::workflow::template::impl_audit_default())
+            .expect("serialize template");
+        conn.execute(
+            "INSERT INTO workflows
+                (workflow_id, template_id, handoff_path, status, current_phase,
+                 blocked_on, created_at, updated_at, template_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "01MIGRATE0000000000000001",
+                "impl-audit",
+                "/handoffs/test.md",
+                "pending",
+                "implement",
+                rusqlite::types::Null,
+                now,
+                now,
+                template_json,
+            ],
+        )
+        .expect("insert old-schema row");
+
+        // Wrap the connection in a WorkflowStore and run migrate().
+        let store = WorkflowStore {
+            db_path: PathBuf::from(":memory:"),
+            conn,
+        };
+        store.migrate().expect("migrate should succeed");
+
+        // Verify the column exists and the default is 0 for the existing row.
+        let idx: i64 = store
+            .conn
+            .query_row(
+                "SELECT current_phase_idx FROM workflows WHERE workflow_id = ?1",
+                params!["01MIGRATE0000000000000001"],
+                |row| row.get(0),
+            )
+            .expect("current_phase_idx column should exist");
+        assert_eq!(idx, 0, "default current_phase_idx should be 0");
+
+        // Verify get_workflow works on the migrated row.
+        let loaded = store
+            .get_workflow(&WorkflowId("01MIGRATE0000000000000001".to_string()))
+            .expect("get_workflow should succeed")
+            .expect("row should exist");
+        assert_eq!(loaded.current_phase_idx, 0);
+    }
+
+    #[test]
+    fn test_loop_guard_counters_round_trip() {
+        use crate::workflow::engine::PhaseStatus;
+
+        let store = temp_store();
+        let mut inst = make_instance("01JNQWFLOOPGUARD000000001");
+        store.insert_workflow(&inst).expect("insert");
+
+        // Simulate a phase with non-zero counters.
+        inst.phase_states[0].status = PhaseStatus::Active;
+        inst.phase_states[0].tool_failure_count = 7;
+        inst.phase_states[0].request_count = 42;
+        store
+            .upsert_phase_state(&inst.workflow_id, &inst.phase_states[0], 0)
+            .expect("upsert phase with counters");
+
+        let loaded = store
+            .get_workflow(&inst.workflow_id)
+            .expect("get")
+            .expect("must exist");
+
+        assert_eq!(
+            loaded.phase_states[0].tool_failure_count, 7,
+            "tool_failure_count must round-trip"
+        );
+        assert_eq!(
+            loaded.phase_states[0].request_count, 42,
+            "request_count must round-trip"
+        );
+    }
+
+    #[test]
+    fn test_migrate_is_idempotent() {
+        let store = temp_store();
+        // migrate() was already called by temp_store(). Call it again.
+        store
+            .migrate()
+            .expect("second migrate should succeed (idempotent)");
+        // Verify the column still works.
+        let idx: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('workflows') WHERE name = 'current_phase_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pragma query");
+        assert_eq!(idx, 1, "current_phase_idx column should exist exactly once");
+    }
+
+    #[test]
+    fn test_find_workflow_by_hash_returns_non_terminal() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWHASH00000000000001");
+        let hash = "abc123deadbeef";
+
+        store
+            .insert_workflow_with_hash(&inst, Some(hash))
+            .expect("insert with hash");
+
+        let found = store
+            .find_workflow_by_hash(hash)
+            .expect("query should succeed");
+        assert!(
+            found.is_some(),
+            "should find a non-terminal workflow by hash"
+        );
+        assert_eq!(
+            found.unwrap().workflow_id,
+            inst.workflow_id,
+            "returned id should match inserted workflow"
+        );
+    }
+
+    #[test]
+    fn test_find_workflow_by_hash_returns_none_for_terminal() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWHASH00000000000002");
+        let hash = "def456cafebabe";
+
+        store
+            .insert_workflow_with_hash(&inst, Some(hash))
+            .expect("insert with hash");
+        store
+            .update_workflow_status(&inst.workflow_id, &WorkflowStatus::Completed, None)
+            .expect("mark completed");
+
+        let found = store
+            .find_workflow_by_hash(hash)
+            .expect("query should succeed");
+        assert!(
+            found.is_none(),
+            "terminal workflow should not be returned by hash lookup"
+        );
+    }
+
+    #[test]
+    fn test_find_and_insert_workflow_by_hash_deduplicates() {
+        let store = temp_store();
+        let inst1 = make_instance("01JNQWHASH00000000000003");
+        let inst2 = make_instance("01JNQWHASH00000000000004");
+        let hash = "xyz789abc123";
+
+        // First call: insert inst1 with the hash
+        let result1 = store
+            .find_and_insert_workflow_by_hash(&inst1, hash)
+            .expect("first insert should succeed");
+        assert_eq!(
+            result1.workflow_id, inst1.workflow_id,
+            "first call should return inst1"
+        );
+
+        // Second call: should find existing inst1 and return it, NOT insert inst2
+        let result2 = store
+            .find_and_insert_workflow_by_hash(&inst2, hash)
+            .expect("second find should succeed");
+        assert_eq!(
+            result2.workflow_id, inst1.workflow_id,
+            "second call should return inst1 (existing), not inst2"
+        );
+
+        // Verify only inst1 exists in the database
+        let inst1_from_db = store
+            .get_workflow(&inst1.workflow_id)
+            .expect("get inst1")
+            .expect("inst1 should exist");
+        assert_eq!(inst1_from_db.workflow_id, inst1.workflow_id);
+
+        let inst2_from_db = store.get_workflow(&inst2.workflow_id).expect("get inst2");
+        assert!(
+            inst2_from_db.is_none(),
+            "inst2 should not have been inserted"
+        );
+
+        // Verify only one row exists for the hash
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflows WHERE content_hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .expect("count hash entries");
+        assert_eq!(count, 1, "only one workflow should exist for this hash");
+    }
+
+    // Note: these tests assert that the workflow is returned with the correct status but
+    // do not verify that tracing::warn! fired. Adding a tracing subscriber (e.g.,
+    // tracing-test crate) would allow that verification — deferred as a follow-up.
+
+    #[test]
+    fn test_find_workflow_by_hash_returns_blocked_on_gate_workflow() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWHASH00000000000005");
+        let hash = "blocked123deadbeef";
+
+        store
+            .insert_workflow_with_hash(&inst, Some(hash))
+            .expect("insert with hash");
+
+        // Mark the workflow as blocked on gate
+        store
+            .update_workflow_status(
+                &inst.workflow_id,
+                &WorkflowStatus::BlockedOnGate,
+                Some("gate_condition"),
+            )
+            .expect("update status to blocked_on_gate");
+
+        // find_workflow_by_hash should still return the workflow (with a warning emitted)
+        let found = store
+            .find_workflow_by_hash(hash)
+            .expect("query should succeed");
+        assert!(found.is_some(), "should return a blocked_on_gate workflow");
+        let wf = found.unwrap();
+        assert_eq!(
+            wf.status,
+            WorkflowStatus::BlockedOnGate,
+            "returned workflow should have blocked_on_gate status"
+        );
+        assert_eq!(
+            wf.workflow_id, inst.workflow_id,
+            "returned id should match inserted workflow"
+        );
+    }
+
+    #[test]
+    fn test_find_workflow_by_hash_returns_awaiting_repair_workflow() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWHASH00000000000006");
+        let hash = "repair456cafebabe";
+
+        store
+            .insert_workflow_with_hash(&inst, Some(hash))
+            .expect("insert with hash");
+
+        // Mark the workflow as awaiting repair
+        store
+            .update_workflow_status(&inst.workflow_id, &WorkflowStatus::AwaitingRepair, None)
+            .expect("update status to awaiting_repair");
+
+        // find_workflow_by_hash should still return the workflow (with a warning emitted)
+        let found = store
+            .find_workflow_by_hash(hash)
+            .expect("query should succeed");
+        assert!(found.is_some(), "should return an awaiting_repair workflow");
+        let wf = found.unwrap();
+        assert_eq!(
+            wf.status,
+            WorkflowStatus::AwaitingRepair,
+            "returned workflow should have awaiting_repair status"
+        );
+        assert_eq!(
+            wf.workflow_id, inst.workflow_id,
+            "returned id should match inserted workflow"
+        );
+    }
+
+    #[test]
+    fn test_find_workflow_by_hash_returns_awaiting_user_input_workflow() {
+        let store = temp_store();
+        let inst = make_instance("01JNQWHASH00000000000007");
+        let hash = "userinput789abcdef";
+
+        store
+            .insert_workflow_with_hash(&inst, Some(hash))
+            .expect("insert with hash");
+
+        store
+            .update_workflow_status(&inst.workflow_id, &WorkflowStatus::AwaitingUserInput, None)
+            .expect("update status to awaiting_user_input");
+
+        let found = store
+            .find_workflow_by_hash(hash)
+            .expect("query should succeed");
+        assert!(
+            found.is_some(),
+            "should return an awaiting_user_input workflow"
+        );
+        let wf = found.unwrap();
+        assert_eq!(wf.status, WorkflowStatus::AwaitingUserInput);
+        assert_eq!(wf.workflow_id, inst.workflow_id);
+    }
+}

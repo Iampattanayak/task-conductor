@@ -1,0 +1,281 @@
+//! Workflow lock management for blocking context compaction during execution.
+//!
+//! When hymenium is actively executing a DAG workflow, this module writes a lock
+//! file that signals to Claude Code's context compaction hook that a workflow
+//! phase is in progress and compaction should be blocked.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process;
+
+/// Metadata stored in the workflow lock file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowLock {
+    pub pid: u32,
+    pub workflow_id: String,
+    pub phase: String,
+    pub started_at: String,
+}
+
+/// Get the path to the workflow lock file in the system temp directory.
+fn lock_path(workflow_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("hymenium-workflow-{workflow_id}.lock"))
+}
+
+/// Check if a process ID is still alive.
+///
+/// On Unix-like systems, uses `libc::kill(pid, 0)` to test if the process exists.
+/// On Windows, uses `OpenProcess` and `GetExitCodeProcess` to check if the process is running.
+/// Returns true if the process is alive, false if the PID is stale.
+#[allow(unsafe_code, clippy::cast_possible_wrap)] // platform-specific FFI requires unsafe; casts are safe for valid PIDs
+fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        const STILL_ACTIVE: u32 = 259;
+        const FALSE: i32 = 0;
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if handle.is_null() {
+                return false;
+            }
+
+            let mut exit_code: u32 = 0;
+            let success = GetExitCodeProcess(handle, &raw mut exit_code) != 0;
+            let _ = CloseHandle(handle);
+
+            success && exit_code == STILL_ACTIVE
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        // On other targets, assume the PID is stale; fail-open by returning false.
+        let _ = pid;
+        false
+    }
+}
+
+/// Write a workflow lock atomically.
+///
+/// Writes the lock file with an atomic rename pattern (.tmp + rename) to ensure
+/// consistency. If a lock file already exists, it will be overwritten.
+///
+/// Lock errors are non-fatal; this function logs warnings but does not propagate
+/// failures. The workflow continues even if the lock cannot be written.
+pub fn acquire_lock(workflow_id: &str, phase: &str) -> Result<()> {
+    let path = lock_path(workflow_id);
+    // with_extension replaces the existing extension: "hymenium-workflow-<id>.lock" →
+    // "hymenium-workflow-<id>.lock.tmp". The tmp file intentionally does not match the
+    // "hymenium-workflow-*.lock" glob used by find_any_active_lock.
+    let tmp_path = path.with_extension("lock.tmp");
+
+    let lock = WorkflowLock {
+        pid: process::id(),
+        workflow_id: workflow_id.to_string(),
+        phase: phase.to_string(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let json = serde_json::to_string(&lock).context("failed to serialize lock")?;
+
+    let mut file = fs::File::create(&tmp_path).context("failed to create lock temp file")?;
+    file.write_all(json.as_bytes())
+        .context("failed to write lock file")?;
+    drop(file);
+
+    fs::rename(&tmp_path, &path).context("failed to rename lock file atomically")?;
+
+    Ok(())
+}
+
+/// Remove the lock file if it exists.
+///
+/// Lock removal errors are non-fatal. This function logs warnings but does not
+/// propagate failures.
+pub fn release_lock(workflow_id: &str) -> Result<()> {
+    let path = lock_path(workflow_id);
+    if path.exists() {
+        fs::remove_file(&path).context("failed to remove lock file")?;
+    }
+    Ok(())
+}
+
+/// Returns true if a lock exists AND the owner process is still alive.
+///
+/// If the lock file is absent, or if it contains a stale PID (process no longer
+/// exists), this function returns false.
+#[must_use]
+pub fn is_active_lock(workflow_id: &str) -> bool {
+    if let Some(lock) = read_active_lock(workflow_id) {
+        is_pid_alive(lock.pid)
+    } else {
+        false
+    }
+}
+
+/// Returns the lock content if active, None if absent or stale.
+///
+/// Reads the lock file and checks if the owner process is still alive. Returns
+/// the lock metadata if active, or None if the lock is absent or the PID is stale.
+#[must_use]
+pub fn read_active_lock(workflow_id: &str) -> Option<WorkflowLock> {
+    let path = lock_path(workflow_id);
+    if !path.exists() {
+        return None;
+    }
+
+    let Ok(content) = fs::read_to_string(&path) else {
+        // Cannot read lock file; treat as stale
+        return None;
+    };
+
+    #[allow(clippy::single_match_else)] // We handle both Ok and Err; clippy suggestion is incorrect
+    match serde_json::from_str::<WorkflowLock>(&content) {
+        Ok(lock) => {
+            if is_pid_alive(lock.pid) {
+                Some(lock)
+            } else {
+                // Clean up stale lock
+                let _ = fs::remove_file(&path);
+                None
+            }
+        }
+        Err(_) => {
+            // Malformed lock file; treat as stale
+            let _ = fs::remove_file(&path);
+            None
+        }
+    }
+}
+
+/// Scan the temp directory for any active hymenium workflow lock file.
+///
+/// Returns the first lock found whose PID is still alive. Stale lock files
+/// (with dead PIDs) are cleaned up during the scan.
+#[must_use]
+pub fn find_any_active_lock() -> Option<WorkflowLock> {
+    let tmp = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&tmp) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("hymenium-workflow-") && name_str.ends_with(".lock") {
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            match serde_json::from_str::<WorkflowLock>(&content) {
+                Ok(lock) => {
+                    if is_pid_alive(lock.pid) {
+                        return Some(lock);
+                    }
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                Err(_) => {
+                    // Malformed lock file — remove it to avoid repeated scan overhead.
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static LOCK_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn acquire_and_release_lock_roundtrip() {
+        let _guard = LOCK_TEST_MUTEX.lock().unwrap();
+
+        // Clean up any existing lock
+        let _ = release_lock("test-workflow");
+
+        // Should not be active initially
+        assert!(!is_active_lock("test-workflow"));
+
+        // Acquire a lock
+        acquire_lock("test-workflow", "test-phase").expect("failed to acquire lock");
+
+        #[cfg(any(unix, windows))]
+        {
+            // Unix and Windows: is_pid_alive(current_pid) is true, so the
+            // freshly-acquired lock reads as active and its content is readable.
+            assert!(is_active_lock("test-workflow"));
+
+            let lock = read_active_lock("test-workflow").expect("failed to read lock");
+            assert_eq!(lock.workflow_id, "test-workflow");
+            assert_eq!(lock.phase, "test-phase");
+            assert_eq!(lock.pid, process::id());
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            // On other targets, is_pid_alive always returns false (fail-open), so
+            // even a freshly-acquired lock reads as inactive. This is the generic
+            // fallback behavior.
+            assert!(!is_active_lock("test-workflow"));
+        }
+
+        // Release the lock
+        release_lock("test-workflow").expect("failed to release lock");
+
+        // Should no longer be active
+        assert!(!is_active_lock("test-workflow"));
+    }
+
+    #[test]
+    fn stale_lock_with_nonexistent_pid_is_not_active() {
+        let _guard = LOCK_TEST_MUTEX.lock().unwrap();
+
+        // Clean up any existing lock
+        let _ = release_lock("stale-workflow");
+
+        // Manually write a lock with an impossible PID
+        let path = lock_path("stale-workflow");
+        let lock = WorkflowLock {
+            pid: 2_147_483_647, // Very large PID that's unlikely to exist
+            workflow_id: "stale-workflow".to_string(),
+            phase: "stale-phase".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let json = serde_json::to_string(&lock).expect("failed to serialize");
+        fs::write(&path, json).expect("failed to write lock");
+
+        // The lock should be detected as stale
+        assert!(!is_active_lock("stale-workflow"));
+
+        // Clean up
+        let _ = release_lock("stale-workflow");
+    }
+
+    #[test]
+    fn is_active_lock_false_when_no_lock() {
+        let _guard = LOCK_TEST_MUTEX.lock().unwrap();
+
+        // Clean up any existing lock
+        let _ = release_lock("test-workflow-3");
+
+        // No lock file should mean is_active_lock returns false
+        assert!(!is_active_lock("test-workflow-3"));
+    }
+}

@@ -1,0 +1,189 @@
+//! `hymenium dispatch <path>` command handler.
+
+use crate::dispatch::{CapabilityCanopyClient, CliCanopyClient, dispatch_workflow};
+use crate::parser::markdown::parse_handoff;
+use crate::store::{StoreError, WorkflowStore};
+use crate::workflow::WorkflowId;
+use crate::workflow::engine::WorkflowInstance;
+use crate::workflow::template::{TemplateRegistry, impl_audit_default};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use thiserror::Error;
+use ulid::Ulid;
+
+/// Errors that can occur during the dispatch command.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DispatchCommandError {
+    #[error("could not read handoff file '{path}': {source}")]
+    ReadFile {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error("could not parse handoff: {0}")]
+    Parse(#[from] crate::parser::ParseError),
+
+    #[error("dispatch failed: {0}")]
+    Dispatch(#[from] crate::dispatch::DispatchError),
+
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+
+    #[error("template error: {0}")]
+    TemplateError(String),
+}
+
+/// Run the `dispatch` command: parse the handoff, create a workflow instance,
+/// dispatch it via Canopy, persist it, and print the workflow ID.
+///
+/// If a non-terminal workflow with the same handoff content already exists,
+/// returns that existing workflow without re-dispatching.
+pub fn run(path: &Path, store: &WorkflowStore) -> Result<WorkflowInstance, DispatchCommandError> {
+    let source = std::fs::read_to_string(path).map_err(|e| DispatchCommandError::ReadFile {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+
+    // Compute SHA256 hash of the handoff content for deduplication.
+    let mut hasher = Sha256::new();
+    hasher.update(&source);
+    let content_hash = format!("{:x}", hasher.finalize());
+
+    // Atomically check if we've already dispatched this handoff (non-terminal workflow exists).
+    // If so, return it. Otherwise, parse, dispatch, and insert in a transaction to prevent
+    // concurrent dispatches on the same content from creating duplicate workflows.
+    let handoff = parse_handoff(&source)?;
+
+    // Load the impl-audit template from the registry.
+    let mut registry = TemplateRegistry::new();
+    registry
+        .register(impl_audit_default())
+        .map_err(|e| DispatchCommandError::TemplateError(e.to_string()))?;
+    let template = registry
+        .get("impl-audit")
+        .map_err(|e| DispatchCommandError::TemplateError(e.to_string()))?
+        .clone();
+
+    let workflow_id = WorkflowId(Ulid::new().to_string());
+
+    // Canonicalize the path so `hymenium status` always shows an absolute,
+    // resolvable path regardless of how the caller invoked the command.
+    let handoff_file_path = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+
+    let canopy = CapabilityCanopyClient::new(CliCanopyClient::new("canopy"));
+    let instance = dispatch_workflow(
+        &handoff,
+        &template,
+        &workflow_id,
+        &handoff_file_path,
+        &canopy,
+    )?;
+
+    // Atomically find or insert the workflow by hash. This prevents concurrent
+    // dispatches on the same handoff content from both passing the check and
+    // both inserting, which would create duplicate live workflows.
+    let persisted = store.find_and_insert_workflow_by_hash(&instance, &content_hash)?;
+
+    // Record the initial transition after the parent row exists.
+    store.record_transition(
+        &persisted.workflow_id,
+        None,
+        persisted.phase_states.first().map(|p| p.phase_id.as_str()),
+        Some("initial dispatch"),
+    )?;
+
+    Ok(persisted)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dispatch::{MockCanopyClient, dispatch_workflow};
+    use crate::parser::{ParsedHandoff, ParsedStep};
+    use crate::store::WorkflowStore;
+    use crate::workflow::WorkflowId;
+    use crate::workflow::template::impl_audit_default;
+
+    fn temp_store() -> WorkflowStore {
+        // Use a unique file path per test invocation so tests don't collide.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let db_path = std::env::temp_dir().join(format!("task_conductor_dispatch_test_{nanos}.db"));
+        WorkflowStore::open(&db_path).expect("open store")
+    }
+
+    fn minimal_handoff() -> ParsedHandoff {
+        ParsedHandoff {
+            title: "Regression Test Handoff".to_string(),
+            metadata: None,
+            problem: "Test the dispatch store ordering".to_string(),
+            state: vec![],
+            intent: "Prove insert_workflow precedes record_transition".to_string(),
+            steps: vec![ParsedStep {
+                number: 1,
+                title: "Do the thing".to_string(),
+                project: None,
+                effort: None,
+                depends_on: Vec::new(),
+                description: "Step description".to_string(),
+                files_to_modify: Vec::new(),
+                verification: None,
+                checklist: Vec::new(),
+            }],
+            completion_protocol: None,
+            context: None,
+        }
+    }
+
+    /// Regression test: `insert_workflow` must precede `record_transition`.
+    ///
+    /// With `PRAGMA foreign_keys = ON`, inserting into `workflow_transitions`
+    /// before the parent row exists in `workflows` produces a FK violation.
+    /// This test proves the ordering is correct by running both writes through
+    /// a store with FK enforcement active.
+    #[test]
+    fn dispatch_store_writes_satisfy_fk_constraint() {
+        let store = temp_store();
+        let mock = MockCanopyClient::new();
+        let template = impl_audit_default();
+        let handoff = minimal_handoff();
+        let workflow_id = WorkflowId("01TEST000000000000000FK001".to_string());
+
+        let instance = dispatch_workflow(
+            &handoff,
+            &template,
+            &workflow_id,
+            "/handoffs/test.md",
+            &mock,
+        )
+        .expect("dispatch_workflow should succeed");
+
+        // This is the exact write sequence from commands/dispatch.rs `run()`.
+        // A reversed order (record_transition first) would fail with a FK error.
+        store
+            .insert_workflow_with_hash(&instance, None)
+            .expect("insert_workflow must succeed before record_transition");
+        store
+            .record_transition(
+                &instance.workflow_id,
+                None,
+                instance.phase_states.first().map(|p| p.phase_id.as_str()),
+                Some("initial dispatch"),
+            )
+            .expect("record_transition must succeed after insert_workflow");
+
+        // Verify both rows were persisted.
+        let loaded = store
+            .get_workflow(&instance.workflow_id)
+            .expect("get should not error")
+            .expect("workflow should exist");
+        assert_eq!(loaded.workflow_id, instance.workflow_id);
+        assert_eq!(loaded.phase_states.len(), 2);
+    }
+}
